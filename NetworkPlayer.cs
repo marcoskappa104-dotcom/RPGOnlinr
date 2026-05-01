@@ -1,114 +1,222 @@
-using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.AI;
 using Mirror;
+using RPG.Data;
+using RPG.UI;
 using RPG.Managers;
+using RPG.Character;
 
 namespace RPG.Network
 {
     /// <summary>
-    /// RPGNetworkManager — substitui o NetworkManager padrão do Mirror.
-    ///
-    /// SETUP NO INSPECTOR:
-    ///   - Player Prefab        → NetworkPlayerPrefab
-    ///   - Spawnable Prefabs    → arraste TODOS os prefabs de monstro aqui
-    ///   - Spawn Points         → Transforms de spawn do player
+    /// NetworkPlayer — representa um jogador na rede.
+    /// 
+    /// Sincroniza via Mirror:
+    ///   - Posição e rotação (NetworkTransformReliable)
+    ///   - Nome do personagem, raça, nível (SyncVar — visto por todos)
+    ///   - HP atual (SyncVar — para a barra de HP de outros players)
+    ///   - Animações (SyncVar de estado)
+    /// 
+    /// Lógica de input e movimento SÓ roda no cliente dono (isLocalPlayer).
     /// </summary>
-    public class RPGNetworkManager : NetworkManager
+    [RequireComponent(typeof(NavMeshAgent))]
+    [RequireComponent(typeof(NetworkTransformReliable))]
+    public class NetworkPlayer : NetworkBehaviour
     {
-        public static new RPGNetworkManager singleton =>
-            (RPGNetworkManager)NetworkManager.singleton;
+        // ── SyncVars — sincronizadas automaticamente server→clients ──────
+        [SyncVar(hook = nameof(OnNameChanged))]
+        public string CharacterName = "...";
 
-        [Header("RPG Settings")]
-        [SerializeField] private Transform[] spawnPoints;
+        [SyncVar(hook = nameof(OnRaceChanged))]
+        public string Race = "Human";
 
-        [Header("Spawnable Prefabs")]
-        [Tooltip("Arraste TODOS os prefabs de monstro aqui (precisam ter NetworkIdentity)")]
-        [SerializeField] private List<GameObject> spawnablePrefabs = new List<GameObject>();
+        [SyncVar]
+        public int Level = 1;
 
-        private readonly Dictionary<int, NetworkPlayer> _connectedPlayers = new();
+        [SyncVar(hook = nameof(OnHPChanged))]
+        public float CurrentHP = 100f;
 
-        // ── Registro de prefabs ───────────────────────────────────────────
+        [SyncVar]
+        public float MaxHP = 100f;
 
-        public override void Awake()
+        [SyncVar(hook = nameof(OnMovingChanged))]
+        public bool IsMoving = false;
+
+        // ── Componentes ───────────────────────────────────────────────────
+        private NavMeshAgent    _agent;
+        private Animator        _animator;
+
+        [Header("Visuals")]
+        [SerializeField] private GameObject      localIndicator;   // seta/coroa sobre o próprio player
+        [SerializeField] private GameObject      nameTagRoot;
+        [SerializeField] private TMPro.TMP_Text  nameTagText;
+        [SerializeField] private UnityEngine.UI.Slider hpBarSlider;
+
+        // ── Dados locais (só no dono) ─────────────────────────────────────
+        private CharacterData _charData;
+        private RPG.Combat.SkillSystem _skillSystem;
+        private float _moveCheckTimer;
+
+        // ── Unity ─────────────────────────────────────────────────────────
+
+        private void Awake()
         {
-            base.Awake();
-            RegisterSpawnablePrefabs();
+            _agent      = GetComponent<NavMeshAgent>();
+            _animator   = GetComponentInChildren<Animator>();
+            _skillSystem = GetComponent<RPG.Combat.SkillSystem>();
         }
 
-        private void RegisterSpawnablePrefabs()
+        // Chamado pelo Mirror quando o objeto é spawned em TODOS os clientes
+        public override void OnStartClient()
         {
-            foreach (var prefab in spawnablePrefabs)
+            // Mostra o nome de todos os players
+            if (nameTagText != null)
+                nameTagText.text = CharacterName;
+
+            // Indicador visual só para o dono local
+            if (localIndicator != null)
+                localIndicator.SetActive(isLocalPlayer);
+        }
+
+        // Chamado apenas no cliente que é dono deste objeto
+        public override void OnStartLocalPlayer()
+        {
+            Debug.Log($"[NetworkPlayer] Você entrou como: {CharacterName}");
+
+            // Carrega dados do personagem selecionado
+            _charData = GameManager.Instance?.SelectedCharacter;
+            if (_charData == null) return;
+
+            // Envia dados ao servidor para sincronizar com todos
+            CmdSetCharacterInfo(
+                _charData.CharacterName,
+                _charData.Race.ToString(),
+                _charData.Level,
+                _charData.CurrentHP,
+                _charData.GetDerivedStats().MaxHP
+            );
+
+            // Inicializa componentes locais
+            var playerEntity = GetComponent<RPG.Character.PlayerEntity>();
+            playerEntity?.Initialize(_charData);
+
+            // Conecta câmera ao player local
+            var cam = FindObjectOfType<RPG.Systems.CameraController>();
+            cam?.SetTarget(transform);
+
+            // Conecta HUD local
+            UIManager.Instance?.BindLocalPlayer(playerEntity);
+        }
+
+        private void Update()
+        {
+            if (!isLocalPlayer) return;
+
+            // Sincroniza estado de movimento para todos verem a animação
+            _moveCheckTimer += Time.deltaTime;
+            if (_moveCheckTimer >= 0.1f)
             {
-                if (prefab == null) continue;
+                _moveCheckTimer = 0f;
+                bool moving = _agent.velocity.sqrMagnitude > 0.05f;
+                if (moving != IsMoving)
+                    CmdSetMoving(moving);
+            }
 
-                var identity = prefab.GetComponent<NetworkIdentity>();
-                if (identity == null)
-                {
-                    Debug.LogError($"[RPGNetworkManager] '{prefab.name}' não tem NetworkIdentity! " +
-                                   "Adicione o componente NetworkIdentity ao prefab.");
-                    continue;
-                }
+            // Atualiza animação local
+            UpdateAnimations(_agent.velocity.sqrMagnitude > 0.05f);
+        }
 
-                // Evita registrar duplicado
-                if (NetworkClient.prefabs.ContainsKey(identity.assetId))
-                {
-                    Debug.Log($"[RPGNetworkManager] '{prefab.name}' já registrado (assetId={identity.assetId}).");
-                    continue;
-                }
+        // ── Commands (Cliente → Servidor) ─────────────────────────────────
 
-                NetworkClient.RegisterPrefab(prefab);
-                Debug.Log($"[RPGNetworkManager] Prefab registrado: '{prefab.name}' (assetId={identity.assetId})");
+        [Command]
+        private void CmdSetCharacterInfo(string charName, string race, int level, float hp, float maxHp)
+        {
+            CharacterName = charName;
+            Race          = race;
+            Level         = level;
+            CurrentHP     = hp;
+            MaxHP         = maxHp;
+        }
+
+        [Command]
+        public void CmdMoveTo(Vector3 destination)
+        {
+            // Servidor valida e executa o movimento
+            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
+                _agent.SetDestination(hit.position);
+        }
+
+        [Command]
+        public void CmdSetMoving(bool moving)
+        {
+            IsMoving = moving;
+        }
+
+ [Server]
+public void ServerApplyDamage(float amount)
+{
+    CurrentHP = Mathf.Max(0, CurrentHP - amount);
+    // O hook OnHPChanged dispara automaticamente para todos os clientes
+}
+
+        [Command]
+        public void CmdSyncHP(float hp, float maxHp)
+        {
+            CurrentHP = hp;
+            MaxHP     = maxHp;
+        }
+
+        // ── ClientRpc (Servidor → Todos os Clientes) ──────────────────────
+
+        [ClientRpc]
+        public void RpcPlayAnimation(string trigger)
+        {
+            _animator?.SetTrigger(trigger);
+        }
+
+        // ── Hooks de SyncVar ──────────────────────────────────────────────
+
+        private void OnNameChanged(string oldName, string newName)
+        {
+            if (nameTagText != null) nameTagText.text = newName;
+        }
+
+        private void OnRaceChanged(string oldRace, string newRace)
+        {
+            // Futuramente: trocar modelo 3D baseado na raça
+        }
+
+        private void OnHPChanged(float oldHP, float newHP)
+        {
+            // Atualiza barra de HP acima do player (visível para outros)
+            if (hpBarSlider != null)
+            {
+                hpBarSlider.maxValue = MaxHP;
+                hpBarSlider.value    = newHP;
+                // Mostra barra só se não tiver HP cheio
+                hpBarSlider.gameObject.SetActive(newHP < MaxHP);
             }
         }
 
-        // ── Server callbacks ──────────────────────────────────────────────
-
-        public override void OnServerAddPlayer(NetworkConnectionToClient conn)
+        private void OnMovingChanged(bool oldVal, bool newVal)
         {
-            Transform spawn = GetSpawnPoint();
-            var playerGO = Instantiate(playerPrefab, spawn.position, spawn.rotation);
-            NetworkServer.AddPlayerForConnection(conn, playerGO);
-
-            var netPlayer = playerGO.GetComponent<NetworkPlayer>();
-            if (netPlayer != null)
-                _connectedPlayers[conn.connectionId] = netPlayer;
-
-            Debug.Log($"[Server] Player conectado: connId={conn.connectionId} — total={numPlayers}");
+            if (!isLocalPlayer) UpdateAnimations(newVal);
         }
 
-        public override void OnServerDisconnect(NetworkConnectionToClient conn)
+        // ── Animações ─────────────────────────────────────────────────────
+
+        private void UpdateAnimations(bool moving)
         {
-            _connectedPlayers.Remove(conn.connectionId);
-            base.OnServerDisconnect(conn);
-            Debug.Log($"[Server] Player desconectado: connId={conn.connectionId} — total={numPlayers}");
+            if (_animator == null) return;
+            _animator.SetBool("IsMoving", moving);
         }
 
-        private Transform GetSpawnPoint()
-        {
-            if (spawnPoints == null || spawnPoints.Length == 0)
-            {
-                var go = new GameObject("DefaultSpawn");
-                go.transform.position = Vector3.zero;
-                return go.transform;
-            }
-            return spawnPoints[numPlayers % spawnPoints.Length];
-        }
+        // ── ITargetable para outros players ──────────────────────────────
 
-        // ── Client callbacks ──────────────────────────────────────────────
-
-        public override void OnClientConnect()
-        {
-            base.OnClientConnect();
-            Debug.Log("[Client] Conectado ao servidor.");
-        }
-
-        public override void OnClientDisconnect()
-        {
-            base.OnClientDisconnect();
-            Debug.Log("[Client] Desconectado do servidor.");
-            GameManager.Instance?.Logout();
-        }
-
-        public IEnumerable<NetworkPlayer> GetAllPlayers() => _connectedPlayers.Values;
+        // NetworkPlayer pode ser selecionado como alvo
+        public string  DisplayName => CharacterName;
+        public float   HPCurrent   => CurrentHP;
+        public float   HPMax       => MaxHP;
+        public bool    Dead        => CurrentHP <= 0;
     }
 }
