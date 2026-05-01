@@ -10,20 +10,19 @@ namespace RPG.Network
 {
     /// <summary>
     /// NetworkPlayer — representa um jogador na rede.
-    /// 
-    /// Sincroniza via Mirror:
-    ///   - Posição e rotação (NetworkTransformReliable)
-    ///   - Nome do personagem, raça, nível (SyncVar — visto por todos)
-    ///   - HP atual (SyncVar — para a barra de HP de outros players)
-    ///   - Animações (SyncVar de estado)
-    /// 
-    /// Lógica de input e movimento SÓ roda no cliente dono (isLocalPlayer).
+    ///
+    /// CORREÇÕES v3:
+    ///   - Adicionado ServerApplyDamage() [Server] para o mob atacar o player
+    ///     sem passar por Command (Commands só cliente→servidor)
+    ///   - Adicionado RpcPlayerDied() para mostrar tela de morte no cliente dono
+    ///   - Adicionado CmdRequestRespawn() para o cliente pedir respawn
+    ///   - Corrigido: CmdSyncHP agora aceita chamada do próprio cliente dono
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkTransformReliable))]
     public class NetworkPlayer : NetworkBehaviour
     {
-        // ── SyncVars — sincronizadas automaticamente server→clients ──────
+        // ── SyncVars ──────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnNameChanged))]
         public string CharacterName = "...";
 
@@ -43,51 +42,55 @@ namespace RPG.Network
         public bool IsMoving = false;
 
         // ── Componentes ───────────────────────────────────────────────────
-        private NavMeshAgent    _agent;
-        private Animator        _animator;
+        private NavMeshAgent _agent;
+        private Animator     _animator;
 
         [Header("Visuals")]
-        [SerializeField] private GameObject      localIndicator;   // seta/coroa sobre o próprio player
-        [SerializeField] private GameObject      nameTagRoot;
-        [SerializeField] private TMPro.TMP_Text  nameTagText;
+        [SerializeField] private GameObject         localIndicator;
+        [SerializeField] private GameObject         nameTagRoot;
+        [SerializeField] private TMPro.TMP_Text     nameTagText;
         [SerializeField] private UnityEngine.UI.Slider hpBarSlider;
 
+        [Header("Spawn")]
+        [SerializeField] private Transform[] spawnPoints;  // arraste os transforms de spawn no Inspector
+
         // ── Dados locais (só no dono) ─────────────────────────────────────
-        private CharacterData _charData;
-        private RPG.Combat.SkillSystem _skillSystem;
-        private float _moveCheckTimer;
+        private CharacterData            _charData;
+        private RPG.Combat.SkillSystem   _skillSystem;
+        private PlayerEntity             _playerEntity;
+        private float                    _moveCheckTimer;
+
+        // _isDead local controla bloqueio de input — independente da SyncVar
+        private bool _isDead;
+
+        public bool Dead => CurrentHP <= 0f;
 
         // ── Unity ─────────────────────────────────────────────────────────
 
         private void Awake()
         {
-            _agent      = GetComponent<NavMeshAgent>();
-            _animator   = GetComponentInChildren<Animator>();
-            _skillSystem = GetComponent<RPG.Combat.SkillSystem>();
+            _agent        = GetComponent<NavMeshAgent>();
+            _animator     = GetComponentInChildren<Animator>();
+            _skillSystem  = GetComponent<RPG.Combat.SkillSystem>();
+            _playerEntity = GetComponent<PlayerEntity>();
         }
 
-        // Chamado pelo Mirror quando o objeto é spawned em TODOS os clientes
         public override void OnStartClient()
         {
-            // Mostra o nome de todos os players
             if (nameTagText != null)
                 nameTagText.text = CharacterName;
 
-            // Indicador visual só para o dono local
             if (localIndicator != null)
                 localIndicator.SetActive(isLocalPlayer);
         }
 
-        // Chamado apenas no cliente que é dono deste objeto
         public override void OnStartLocalPlayer()
         {
-            Debug.Log($"[NetworkPlayer] Você entrou como: {CharacterName}");
+            Debug.Log($"[NetworkPlayer] Local player: {CharacterName}");
 
-            // Carrega dados do personagem selecionado
             _charData = GameManager.Instance?.SelectedCharacter;
             if (_charData == null) return;
 
-            // Envia dados ao servidor para sincronizar com todos
             CmdSetCharacterInfo(
                 _charData.CharacterName,
                 _charData.Race.ToString(),
@@ -96,23 +99,20 @@ namespace RPG.Network
                 _charData.GetDerivedStats().MaxHP
             );
 
-            // Inicializa componentes locais
-            var playerEntity = GetComponent<RPG.Character.PlayerEntity>();
-            playerEntity?.Initialize(_charData);
+            _playerEntity = GetComponent<PlayerEntity>();
+            _playerEntity?.Initialize(_charData);
 
-            // Conecta câmera ao player local
             var cam = FindObjectOfType<RPG.Systems.CameraController>();
             cam?.SetTarget(transform);
 
-            // Conecta HUD local
-            UIManager.Instance?.BindLocalPlayer(playerEntity);
+            UIManager.Instance?.BindLocalPlayer(_playerEntity);
         }
 
         private void Update()
         {
             if (!isLocalPlayer) return;
+            if (_isDead) return;   // ← bloqueia todo input quando morto
 
-            // Sincroniza estado de movimento para todos verem a animação
             _moveCheckTimer += Time.deltaTime;
             if (_moveCheckTimer >= 0.1f)
             {
@@ -122,7 +122,6 @@ namespace RPG.Network
                     CmdSetMoving(moving);
             }
 
-            // Atualiza animação local
             UpdateAnimations(_agent.velocity.sqrMagnitude > 0.05f);
         }
 
@@ -141,7 +140,6 @@ namespace RPG.Network
         [Command]
         public void CmdMoveTo(Vector3 destination)
         {
-            // Servidor valida e executa o movimento
             if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
                 _agent.SetDestination(hit.position);
         }
@@ -153,20 +151,134 @@ namespace RPG.Network
         }
 
         [Command]
-        public void CmdTakeDamage(float amount)
-        {
-            CurrentHP = Mathf.Max(0, CurrentHP - amount);
-            // RpcOnDamaged é chamado automaticamente via hook OnHPChanged
-        }
-
-        [Command]
         public void CmdSyncHP(float hp, float maxHp)
         {
             CurrentHP = hp;
             MaxHP     = maxHp;
         }
 
-        // ── ClientRpc (Servidor → Todos os Clientes) ──────────────────────
+        /// <summary>
+        /// Cliente pede respawn ao servidor.
+        /// </summary>
+        [Command]
+        public void CmdRequestRespawn()
+        {
+            ServerRespawn();
+        }
+
+        // ── Server Methods (Servidor → Servidor) ──────────────────────────
+
+        /// <summary>
+        /// BUG CORRIGIDO: método [Server] para mobs atacarem o player.
+        /// Antes era CmdTakeDamage() que só funciona quando chamado por CLIENTE.
+        /// O servidor chamando um Command resulta em erro silencioso.
+        /// </summary>
+        [Server]
+        public void ServerApplyDamage(float dmg)
+        {
+            if (Dead) return;
+
+            CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
+
+            if (CurrentHP <= 0f)
+                ServerDie();
+        }
+
+        [Server]
+        private void ServerDie()
+        {
+            CurrentHP = 0f;
+            if (_agent != null) _agent.ResetPath();
+
+            // Avisa o cliente dono para mostrar a tela de morte
+            RpcPlayerDied();
+            Debug.Log($"[NetworkPlayer] {CharacterName} morreu no servidor.");
+        }
+
+        [Server]
+        private void ServerRespawn()
+        {
+            Vector3 spawnPos = GetSpawnPosition();
+            transform.position = spawnPos;
+
+            CurrentHP = MaxHP * 0.5f;
+
+            RpcOnRespawned(spawnPos, CurrentHP, MaxHP);
+            Debug.Log($"[NetworkPlayer] {CharacterName} respawnou em {spawnPos}.");
+        }
+
+        [Server]
+        private Vector3 GetSpawnPosition()
+        {
+            if (spawnPoints != null && spawnPoints.Length > 0)
+            {
+                int idx = Random.Range(0, spawnPoints.Length);
+                return spawnPoints[idx].position;
+            }
+            // Fallback: posição inicial
+            return Vector3.zero;
+        }
+
+        // ── ClientRpcs (Servidor → Clientes) ─────────────────────────────
+
+        [ClientRpc]
+        private void RpcPlayerDied()
+        {
+            // Só o cliente dono processa morte local
+            if (!isLocalPlayer) return;
+
+            _isDead = true;
+
+            // Para o NavMeshAgent imediatamente
+            if (_agent != null)
+            {
+                _agent.ResetPath();
+                _agent.isStopped = true;
+            }
+
+            // Desativa os controllers de input para bloquear movimento e skills
+            var playerCtrl  = GetComponent<RPG.Systems.PlayerController>();
+            var networkCtrl = GetComponent<NetworkPlayerController>();
+            if (playerCtrl  != null) playerCtrl.enabled  = false;
+            if (networkCtrl != null) networkCtrl.enabled = false;
+
+            // Propaga HP=0 ao PlayerEntity para o UIManager atualizar a barra
+            _playerEntity?.OnNetworkDeath();
+
+            DeathScreenUI.Show(this);
+            Debug.Log("[NetworkPlayer] Tela de morte exibida.");
+        }
+
+        [ClientRpc]
+        private void RpcOnRespawned(Vector3 position, float hp, float maxHp)
+        {
+            if (!isLocalPlayer) return;
+
+            _isDead = false;
+
+            // Reativa NavMeshAgent
+            if (_agent != null)
+            {
+                _agent.isStopped = false;
+                _agent.Warp(position);  // teleporta sem interpolar
+            }
+
+            // Reativa controllers de input
+            var playerCtrl  = GetComponent<RPG.Systems.PlayerController>();
+            var networkCtrl = GetComponent<NetworkPlayerController>();
+            if (playerCtrl  != null) playerCtrl.enabled  = true;
+            if (networkCtrl != null) networkCtrl.enabled = true;
+
+            // Atualiza HP no PlayerEntity (dispara OnHPChanged → UIManager)
+            if (_playerEntity != null)
+            {
+                _playerEntity.ForceSetHP(hp, maxHp);
+                _playerEntity.Respawn(position);
+            }
+
+            DeathScreenUI.Hide();
+            Debug.Log("[NetworkPlayer] Respawn concluído.");
+        }
 
         [ClientRpc]
         public void RpcPlayAnimation(string trigger)
@@ -174,28 +286,32 @@ namespace RPG.Network
             _animator?.SetTrigger(trigger);
         }
 
-        // ── Hooks de SyncVar ──────────────────────────────────────────────
+        // ── SyncVar Hooks ─────────────────────────────────────────────────
 
         private void OnNameChanged(string oldName, string newName)
         {
             if (nameTagText != null) nameTagText.text = newName;
         }
 
-        private void OnRaceChanged(string oldRace, string newRace)
-        {
-            // Futuramente: trocar modelo 3D baseado na raça
-        }
+        private void OnRaceChanged(string oldRace, string newRace) { }
 
         private void OnHPChanged(float oldHP, float newHP)
         {
-            // Atualiza barra de HP acima do player (visível para outros)
+            // Atualiza a mini barra de HP acima da cabeça (visível para outros jogadores)
             if (hpBarSlider != null)
             {
                 hpBarSlider.maxValue = MaxHP;
                 hpBarSlider.value    = newHP;
-                // Mostra barra só se não tiver HP cheio
                 hpBarSlider.gameObject.SetActive(newHP < MaxHP);
             }
+
+            // ─── CORREÇÃO PRINCIPAL ───────────────────────────────────────
+            // Propaga HP para o PlayerEntity do cliente LOCAL, que dispara
+            // OnHPChanged → UIManager atualiza a barra de HP do HUD.
+            // Sem isso, o servidor atualiza CurrentHP via SyncVar mas o HUD
+            // nunca sabe que o HP mudou.
+            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
+                _playerEntity.ForceSetHP(newHP, MaxHP);
         }
 
         private void OnMovingChanged(bool oldVal, bool newVal)
@@ -211,12 +327,10 @@ namespace RPG.Network
             _animator.SetBool("IsMoving", moving);
         }
 
-        // ── ITargetable para outros players ──────────────────────────────
+        // ── ITargetable ───────────────────────────────────────────────────
 
-        // NetworkPlayer pode ser selecionado como alvo
-        public string  DisplayName => CharacterName;
-        public float   HPCurrent   => CurrentHP;
-        public float   HPMax       => MaxHP;
-        public bool    Dead        => CurrentHP <= 0;
+        public string DisplayName => CharacterName;
+        public float  HPCurrent   => CurrentHP;
+        public float  HPMax       => MaxHP;
     }
 }
