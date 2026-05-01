@@ -1,294 +1,314 @@
 using UnityEngine;
 using UnityEngine.AI;
+using Mirror;
 using RPG.Data;
-using RPG.Managers;
 using RPG.UI;
-using System;
+using RPG.Managers;
+using RPG.Character;
 
-namespace RPG.Character
+namespace RPG.Network
 {
     /// <summary>
-    /// PlayerEntity — stats, dano, cura, regen e morte do jogador.
+    /// NetworkPlayer v4 — jogador online completo.
     ///
-    /// CORREÇÕES v2:
-    ///   - Adicionado OnNetworkDeath() chamado pelo NetworkPlayer quando
-    ///     o servidor confirma morte (evita estado de morto inconsistente)
-    ///   - HealToFull() e ForceSetHP() agora existem nesta versão definitiva
-    ///   - Die() virou private mas OnNetworkDeath() permite trigger externo
-    ///   - Regen não toca Heal() (que tem FloatingText) — chama HealSilent()
+    /// MUDANÇAS:
+    ///   - Implementa ITargetable para outros jogadores poderem ser clicados
+    ///   - Removida toda lógica offline
+    ///   - Controller de input separado em NetworkPlayerController
+    ///   - OnHPChanged propaga para PlayerEntity → UIManager atualiza HUD
+    ///   - _isDead bloqueia Update e é resetado no respawn
+    ///   - ServerApplyDamage [Server] — chamado pelo mob sem passar por Command
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
-    public class PlayerEntity : MonoBehaviour
+    [RequireComponent(typeof(NetworkTransformReliable))]
+    public class NetworkPlayer : NetworkBehaviour, ITargetable
     {
-        // ── Runtime stats ─────────────────────────────────────────────────
-        public CharacterData Data        { get; private set; }
-        public DerivedStats  Stats       { get; private set; }
-        public BuffBonuses   ActiveBuffs { get; private set; } = new BuffBonuses();
+        // ── SyncVars ──────────────────────────────────────────────────────
+        [SyncVar(hook = nameof(OnNameChanged))]
+        public string CharacterName = "...";
 
-        public float CurrentHP { get; private set; }
-        public float CurrentMP { get; private set; }
+        [SyncVar(hook = nameof(OnRaceChanged))]
+        public string Race = "Human";
 
-        public bool IsInitialized => Data != null && Stats != null;
+        [SyncVar]
+        public int Level = 1;
 
-        // ── Eventos ───────────────────────────────────────────────────────
-        public event Action<float, float> OnHPChanged;
-        public event Action<float, float> OnMPChanged;
-        public event Action<bool>         OnDeathChanged;
-        public event Action               OnStatsChanged;
+        [SyncVar(hook = nameof(OnHPChanged))]
+        public float CurrentHP = 100f;
+
+        [SyncVar]
+        public float MaxHP = 100f;
+
+        [SyncVar(hook = nameof(OnMovingChanged))]
+        public bool IsMoving = false;
+
+        // ── ITargetable ───────────────────────────────────────────────────
+        string  ITargetable.DisplayName => CharacterName;
+        float   ITargetable.CurrentHP   => CurrentHP;
+        float   ITargetable.MaxHP       => MaxHP;
+        bool    ITargetable.IsDead      => Dead;
+        Vector3 ITargetable.Position    => transform.position;
+
+        public void OnSelected()   { if (selectionIndicator) selectionIndicator.SetActive(true);  }
+        public void OnDeselected() { if (selectionIndicator) selectionIndicator.SetActive(false); }
+
+        // PvP desabilitado por enquanto — não aplica dano entre jogadores
+        public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
+        {
+            Debug.Log("[NetworkPlayer] PvP não implementado.");
+        }
 
         // ── Componentes ───────────────────────────────────────────────────
         private NavMeshAgent _agent;
-        public  NavMeshAgent Agent => _agent;
+        private Animator     _animator;
 
-        private bool  _isDead;
-        private float _regenTimer;
-        private const float REGEN_INTERVAL = 5f;
+        [Header("Visuals — World Space")]
+        [SerializeField] private GameObject            selectionIndicator;
+        [SerializeField] private TMPro.TMP_Text        nameTagText;
+        [SerializeField] private UnityEngine.UI.Slider hpBarSlider;  // mini barra acima da cabeça
 
-        public ITargetable CurrentTarget { get; private set; }
+        [Header("Spawn Points")]
+        [Tooltip("Arraste os Transforms de spawn aqui. Se vazio, spawna em Vector3.zero.")]
+        [SerializeField] private Transform[] spawnPoints;
+
+        // ── Estado local (só cliente dono) ────────────────────────────────
+        private CharacterData  _charData;
+        private PlayerEntity   _playerEntity;
+        private bool           _isDead;
+        private float          _moveCheckTimer;
+
+        public bool Dead => CurrentHP <= 0f;
+
+        // ── Unity / Mirror ────────────────────────────────────────────────
 
         private void Awake()
         {
-            _agent = GetComponent<NavMeshAgent>();
+            _agent        = GetComponent<NavMeshAgent>();
+            _animator     = GetComponentInChildren<Animator>();
+            _playerEntity = GetComponent<PlayerEntity>();
         }
 
-        private void Start()
+        public override void OnStartClient()
         {
-            // Offline: inicializa direto. Online: NetworkPlayer chama Initialize() após spawn.
-            var charData = GameManager.Instance?.SelectedCharacter;
-            if (charData != null && !IsInitialized)
-                Initialize(charData);
+            if (nameTagText     != null) nameTagText.text = CharacterName;
+            if (selectionIndicator != null) selectionIndicator.SetActive(false);
+        }
+
+        public override void OnStartLocalPlayer()
+        {
+            Debug.Log($"[NetworkPlayer] Local player iniciado: {CharacterName}");
+
+            _charData = GameManager.Instance?.SelectedCharacter;
+            if (_charData == null)
+            {
+                Debug.LogError("[NetworkPlayer] SelectedCharacter é null! Verifique o GameManager.");
+                return;
+            }
+
+            // Envia dados ao servidor para sincronizar com todos
+            CmdSetCharacterInfo(
+                _charData.CharacterName,
+                _charData.Race.ToString(),
+                _charData.Level,
+                _charData.CurrentHP,
+                _charData.GetDerivedStats().MaxHP
+            );
+
+            // Inicializa PlayerEntity com os dados do personagem
+            _playerEntity = GetComponent<PlayerEntity>();
+            _playerEntity?.Initialize(_charData);
+
+            // O NetworkPlayerController cuida da câmera e do HUD binding
         }
 
         private void Update()
         {
-            if (!IsInitialized || _isDead) return;
-            HandleRegen();
-        }
+            if (!isLocalPlayer) return;
+            if (_isDead) return;
 
-        // ── Inicialização ─────────────────────────────────────────────────
-
-        public void Initialize(CharacterData data)
-        {
-            if (data == null)
+            // Sincroniza IsMoving com o servidor a cada 0.1s
+            _moveCheckTimer += Time.deltaTime;
+            if (_moveCheckTimer >= 0.1f)
             {
-                Debug.LogWarning("[PlayerEntity] Initialize com data null — ignorado.");
-                return;
+                _moveCheckTimer = 0f;
+                bool moving = _agent.velocity.sqrMagnitude > 0.05f;
+                if (moving != IsMoving) CmdSetMoving(moving);
             }
 
-            Data = data;
-            RefreshStats();
-
-            CurrentHP = data.CurrentHP > 0 ? data.CurrentHP : Stats.MaxHP;
-            CurrentMP = data.CurrentMP > 0 ? data.CurrentMP : Stats.MaxMP;
-
-            if (_agent != null)
-            {
-                _agent.speed            = Mathf.Clamp(Stats.ASPD * 0.8f, 2f, 10f);
-                _agent.stoppingDistance = 0.5f;
-            }
+            if (!isLocalPlayer) UpdateAnimations(_agent.velocity.sqrMagnitude > 0.05f);
         }
 
-        // ── Stats ─────────────────────────────────────────────────────────
+        // ── Commands (Cliente → Servidor) ─────────────────────────────────
 
-        public void RefreshStats()
+        [Command]
+        private void CmdSetCharacterInfo(string charName, string race, int level, float hp, float maxHp)
         {
-            if (Data == null) return;
-            Stats = Data.GetDerivedStats(ActiveBuffs);
-            if (_agent != null)
-                _agent.speed = Mathf.Clamp(Stats.ASPD * 0.8f, 2f, 10f);
-            OnStatsChanged?.Invoke();
+            CharacterName = charName;
+            Race          = race;
+            Level         = level;
+            CurrentHP     = hp;
+            MaxHP         = maxHp;
         }
 
-        // ── Movimento ─────────────────────────────────────────────────────
+        [Command]
+        public void CmdSetMoving(bool moving) => IsMoving = moving;
 
-        public void MoveTo(Vector3 destination)
+        [Command]
+        public void CmdSyncHP(float hp, float maxHp)
         {
-            if (_isDead || _agent == null) return;
-            _agent.SetDestination(destination);
+            CurrentHP = hp;
+            MaxHP     = maxHp;
         }
 
-        public void StopMovement() => _agent?.ResetPath();
+        [Command]
+        public void CmdRequestRespawn() => ServerRespawn();
 
-        public bool HasReachedDestination()
-        {
-            if (_agent == null) return false;
-            return !_agent.pathPending
-                && _agent.remainingDistance <= _agent.stoppingDistance
-                && (!_agent.hasPath || _agent.velocity.sqrMagnitude < 0.01f);
-        }
-
-        // ── Alvo ──────────────────────────────────────────────────────────
-
-        public void SetTarget(ITargetable target)
-        {
-            CurrentTarget?.OnDeselected();
-            CurrentTarget = target;
-            CurrentTarget?.OnSelected();
-        }
-
-        public void ClearTarget()
-        {
-            CurrentTarget?.OnDeselected();
-            CurrentTarget = null;
-        }
-
-        // ── Dano & Cura ───────────────────────────────────────────────────
-
-        public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
-        {
-            if (!IsInitialized || _isDead) return;
-
-            bool crit = StatsCalculator.RollCrit(Stats.CRIT);
-            bool hit  = StatsCalculator.RollHit(100f, Stats.FLEE);
-
-            if (!hit)
-            {
-                FloatingTextManager.Instance?.Show("MISS", transform.position, Color.gray);
-                return;
-            }
-
-            float dmg = isPhysical
-                ? StatsCalculator.CalculatePhysicalDamage(rawAtk, Stats.DEF, crit, Stats.CritDMG)
-                : StatsCalculator.CalculateMagicDamage(rawMatk, Stats.MDEF, crit, Stats.CritDMG);
-
-            dmg *= 1f - (Stats.DamageReduction / 100f);
-            dmg  = Mathf.Max(1f, dmg);
-
-            CurrentHP = Mathf.Max(0, CurrentHP - dmg);
-            OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
-
-            Color color = crit ? Color.yellow : Color.red;
-            FloatingTextManager.Instance?.Show(
-                crit ? $"CRÍTICO! {dmg:0}" : $"{dmg:0}", transform.position, color);
-
-            if (CurrentHP <= 0) Die();
-        }
-
-        public void Heal(float amount)
-        {
-            if (!IsInitialized || _isDead) return;
-            CurrentHP = Mathf.Min(Stats.MaxHP, CurrentHP + amount);
-            OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
-            FloatingTextManager.Instance?.Show($"+{amount:0}", transform.position, Color.green);
-        }
-
-        /// <summary>Cura silenciosa usada internamente (regen) — sem FloatingText.</summary>
-        private void HealSilent(float amount)
-        {
-            if (!IsInitialized || _isDead) return;
-            CurrentHP = Mathf.Min(Stats.MaxHP, CurrentHP + amount);
-            OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
-        }
-
-        public void RestoreMP(float amount)
-        {
-            if (!IsInitialized) return;
-            CurrentMP = Mathf.Min(Stats.MaxMP, CurrentMP + amount);
-            OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
-        }
-
-        public bool SpendMP(float amount)
-        {
-            if (!IsInitialized || CurrentMP < amount) return false;
-            CurrentMP -= amount;
-            OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
-            return true;
-        }
-
-        /// <summary>Restaura HP e MP ao máximo (usado no level up).</summary>
-        public void HealToFull()
-        {
-            if (!IsInitialized) return;
-            CurrentHP = Stats.MaxHP;
-            CurrentMP = Stats.MaxMP;
-            OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
-            OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
-        }
+        // ── Server Methods ────────────────────────────────────────────────
 
         /// <summary>
-        /// Força HP a um valor específico (sincronização com servidor).
-        /// Nota: Stats.MaxHP é mutable propositalmente para este caso.
+        /// Chamado pelo NetworkMonsterEntity.ServerAttack() diretamente no servidor.
+        /// [Server] garante que só executa no servidor — sem passar por Command.
         /// </summary>
-        public void ForceSetHP(float hp, float maxHp)
+        [Server]
+        public void ServerApplyDamage(float dmg)
         {
-            if (!IsInitialized) return;
-            Stats.MaxHP = maxHp;
-            CurrentHP   = Mathf.Clamp(hp, 0f, maxHp);
-            OnHPChanged?.Invoke(CurrentHP, maxHp);
-            if (CurrentHP <= 0 && !_isDead) Die();
+            if (Dead) return;
+
+            CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
+            Debug.Log($"[NetworkPlayer] {CharacterName} tomou {dmg:0} | HP:{CurrentHP:0}/{MaxHP:0}");
+
+            if (CurrentHP <= 0f)
+                ServerDie();
         }
 
-        // ── Morte ─────────────────────────────────────────────────────────
-
-        private void Die()
+        [Server]
+        private void ServerDie()
         {
-            if (_isDead) return;
-            _isDead = true;
-            _agent?.ResetPath();
-            OnDeathChanged?.Invoke(true);
-            Debug.Log($"[PlayerEntity] {Data?.CharacterName} morreu (local/offline).");
-        }
-
-        /// <summary>
-        /// Chamado pelo NetworkPlayer.RpcPlayerDied() quando o SERVIDOR confirma a morte.
-        /// Garante que o estado local seja consistente com o servidor.
-        /// </summary>
-        public void OnNetworkDeath()
-        {
-            if (_isDead) return;
-            _isDead   = true;
             CurrentHP = 0f;
-            _agent?.ResetPath();
-            OnHPChanged?.Invoke(0f, Stats?.MaxHP ?? 1f);
-            OnDeathChanged?.Invoke(true);
-            Debug.Log($"[PlayerEntity] {Data?.CharacterName} morte confirmada pelo servidor.");
+            if (_agent != null) _agent.ResetPath();
+
+            Debug.Log($"[NetworkPlayer] {CharacterName} morreu no servidor.");
+            RpcPlayerDied();
         }
 
-        public void Respawn(Vector3 position)
+        [Server]
+        private void ServerRespawn()
         {
-            if (!IsInitialized) return;
-            _isDead = false;
-            transform.position = position;
-            CurrentHP = Stats.MaxHP * 0.5f;
-            CurrentMP = Stats.MaxMP * 0.5f;
-            OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
-            OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
-            OnDeathChanged?.Invoke(false);
+            Vector3 pos = GetSpawnPosition();
+            transform.position = pos;
+            CurrentHP          = MaxHP * 0.5f;
+
+            Debug.Log($"[NetworkPlayer] {CharacterName} respawnou em {pos}.");
+            RpcOnRespawned(pos, CurrentHP, MaxHP);
         }
 
-        // ── Regen ─────────────────────────────────────────────────────────
-
-        private void HandleRegen()
+        [Server]
+        private Vector3 GetSpawnPosition()
         {
-            _regenTimer += Time.deltaTime;
-            if (_regenTimer < REGEN_INTERVAL) return;
-            _regenTimer = 0f;
+            if (spawnPoints != null && spawnPoints.Length > 0)
+                return spawnPoints[Random.Range(0, spawnPoints.Length)].position;
+            return Vector3.zero;
+        }
 
-            // Usa HealSilent para evitar FloatingText de regen constante
-            if (CurrentHP < Stats.MaxHP) HealSilent(Stats.HPRegen);
-            if (CurrentMP < Stats.MaxMP)
+        // ── ClientRpcs (Servidor → Clientes) ─────────────────────────────
+
+        [ClientRpc]
+        private void RpcPlayerDied()
+        {
+            if (!isLocalPlayer) return;
+
+            _isDead = true;
+
+            // Para o agente
+            if (_agent != null)
             {
-                CurrentMP = Mathf.Min(Stats.MaxMP, CurrentMP + Stats.MPRegen);
-                OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
+                _agent.ResetPath();
+                _agent.isStopped = true;
             }
+
+            // Desativa controller de input
+            var ctrl = GetComponent<NetworkPlayerController>();
+            if (ctrl != null) ctrl.enabled = false;
+
+            // Propaga HP=0 ao PlayerEntity → UIManager atualiza barra
+            _playerEntity?.OnNetworkDeath();
+
+            DeathScreenUI.Show(this);
+            Debug.Log("[NetworkPlayer] Morte processada no cliente.");
         }
 
-        // ── Save ──────────────────────────────────────────────────────────
-
-        public void SaveToData()
+        [ClientRpc]
+        private void RpcOnRespawned(Vector3 position, float hp, float maxHp)
         {
-            if (!IsInitialized) return;
-            if (GameManager.Instance?.CurrentAccount == null) return;
+            if (!isLocalPlayer) return;
 
-            Data.CurrentHP = CurrentHP;
-            Data.CurrentMP = CurrentMP;
-            Data.PosX      = transform.position.x;
-            Data.PosY      = transform.position.y;
-            Data.PosZ      = transform.position.z;
+            _isDead = false;
 
-            SaveManager.Instance?.SaveCharacter(GameManager.Instance.CurrentAccount, Data);
+            // Reativa agente e teleporta
+            if (_agent != null)
+            {
+                _agent.isStopped = false;
+                _agent.Warp(position);
+            }
+
+            // Reativa controller de input
+            var ctrl = GetComponent<NetworkPlayerController>();
+            if (ctrl != null) ctrl.enabled = true;
+
+            // Atualiza HP no PlayerEntity → UIManager
+            if (_playerEntity != null)
+            {
+                _playerEntity.ForceSetHP(hp, maxHp);
+                _playerEntity.Respawn(position);
+            }
+
+            DeathScreenUI.Hide();
+            Debug.Log("[NetworkPlayer] Respawn concluído no cliente.");
         }
 
-        private void OnApplicationQuit() => SaveToData();
+        [ClientRpc]
+        public void RpcPlayAnimation(string trigger)
+        {
+            _animator?.SetTrigger(trigger);
+        }
+
+        // ── SyncVar Hooks ─────────────────────────────────────────────────
+
+        private void OnNameChanged(string _, string newName)
+        {
+            if (nameTagText != null) nameTagText.text = newName;
+        }
+
+        private void OnRaceChanged(string _, string newRace) { }
+
+        private void OnHPChanged(float _, float newHP)
+        {
+            // Atualiza mini barra acima da cabeça (visível para todos)
+            if (hpBarSlider != null)
+            {
+                hpBarSlider.maxValue = MaxHP;
+                hpBarSlider.value    = newHP;
+                hpBarSlider.gameObject.SetActive(newHP < MaxHP);
+            }
+
+            // ── CORREÇÃO PRINCIPAL ────────────────────────────────────────
+            // Propaga HP para PlayerEntity do cliente DONO.
+            // Sem isso, o servidor atualiza CurrentHP via SyncVar mas o HUD
+            // do player nunca é atualizado — barra de HP fica estática.
+            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
+                _playerEntity.ForceSetHP(newHP, MaxHP);
+        }
+
+        private void OnMovingChanged(bool _, bool newVal)
+        {
+            if (!isLocalPlayer) UpdateAnimations(newVal);
+        }
+
+        // ── Animações ─────────────────────────────────────────────────────
+
+        private void UpdateAnimations(bool moving)
+        {
+            _animator?.SetBool("IsMoving", moving);
+        }
     }
 }
