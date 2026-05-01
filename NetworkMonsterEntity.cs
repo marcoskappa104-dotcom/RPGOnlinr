@@ -1,124 +1,415 @@
 using UnityEngine;
 using UnityEngine.AI;
-using UnityEngine.EventSystems;
 using Mirror;
-using RPG.Character;
+using RPG.Data;
 using RPG.UI;
+using RPG.Character;
 
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayerController — processa input APENAS no cliente local.
-    /// Envia comandos ao servidor via CmdMoveTo.
-    /// 
-    /// Substitui o PlayerController offline quando em modo online.
+    /// NetworkMonsterEntity — monstro online.
+    /// Usa as MESMAS fórmulas de StatsCalculator do player.
+    /// IA roda APENAS no servidor. HP sincronizado via SyncVar.
     /// </summary>
-    [RequireComponent(typeof(NetworkPlayer))]
-    public class NetworkPlayerController : NetworkBehaviour
+    [RequireComponent(typeof(NavMeshAgent))]
+    [RequireComponent(typeof(NetworkIdentity))]
+    [RequireComponent(typeof(NetworkTransformReliable))]
+    public class NetworkMonsterEntity : NetworkBehaviour, ITargetable
     {
-        [Header("Layers")]
-        [SerializeField] private LayerMask terrainLayer   = ~0;
-        [SerializeField] private LayerMask targetableLayer;
+        // ── Config ────────────────────────────────────────────────────────
+        [Header("Identidade")]
+        [SerializeField] private string monsterDisplayName = "Monstro";
+        [SerializeField] private int    level              = 1;
 
-        [Header("Skills")]
-        [SerializeField] private KeyCode skill1Key = KeyCode.Q;
-        [SerializeField] private KeyCode skill2Key = KeyCode.W;
-        [SerializeField] private KeyCode skill3Key = KeyCode.E;
-        [SerializeField] private KeyCode skill4Key = KeyCode.R;
+        [Header("Atributos Base (mesmas fórmulas do player)")]
+        [SerializeField] private int baseSTR = 12;
+        [SerializeField] private int baseAGI = 8;
+        [SerializeField] private int baseVIT = 10;
+        [SerializeField] private int baseDEX = 8;
+        [SerializeField] private int baseINT = 5;
+        [SerializeField] private int baseLUK = 5;
 
-        [Header("Move Indicator")]
-        [SerializeField] private GameObject moveIndicatorPrefab;
+        [Header("Comportamento")]
+        [SerializeField] private float aggroRange     = 10f;
+        [SerializeField] private float attackRange    = 2.5f;
+        [SerializeField] private float kiteDistance   = 1.8f;
+        [SerializeField] private float attackCooldown = 2f;
+        [SerializeField] private Transform[] patrolPoints;
 
-        private NetworkPlayer            _netPlayer;
-        private NavMeshAgent             _agent;
-        private RPG.Combat.SkillSystem   _skills;
+        [Header("Recompensa")]
+        [SerializeField] private long expReward = 50;
+
+        [Header("Visuals")]
+        [SerializeField] private GameObject      selectionIndicator;
+        [SerializeField] private MonsterHealthBarUI healthBarUI;
+
+        // ── SyncVars ──────────────────────────────────────────────────────
+        [SyncVar(hook = nameof(OnCurrentHPChanged))]
+        private float _currentHP;
+
+        [SyncVar]
+        private float _maxHP;
+
+        [SyncVar(hook = nameof(OnDeadChanged))]
+        private bool _isDead;
+
+        // ── ITargetable ───────────────────────────────────────────────────
+        public string  DisplayName => monsterDisplayName;
+        public float   CurrentHP   => _currentHP;
+        public float   MaxHP       => _maxHP;
+        public bool    IsDead      => _isDead;
+        public Vector3 Position    => transform.position;
+
+        public void OnSelected()   { if (selectionIndicator) selectionIndicator.SetActive(true);  }
+        public void OnDeselected() { if (selectionIndicator) selectionIndicator.SetActive(false); }
+
+        // ── Stats (calculados igual ao player) ────────────────────────────
+        private DerivedStats _stats;
+
+        // ── IA (server only) ──────────────────────────────────────────────
+        private enum State { Idle, Patrol, Chase, Combat, Dead }
+        private State        _state = State.Idle;
+        private NavMeshAgent _agent;
+        private Animator     _animator;
+        private NetworkPlayer _aggroTarget;
+        private float         _attackTimer;
+        private int           _patrolIndex;
+
+        // ── Init ──────────────────────────────────────────────────────────
 
         private void Awake()
         {
-            _netPlayer = GetComponent<NetworkPlayer>();
-            _agent     = GetComponent<NavMeshAgent>();
-            _skills    = GetComponent<RPG.Combat.SkillSystem>();
+            _agent    = GetComponent<NavMeshAgent>();
+            _animator = GetComponentInChildren<Animator>();
+
+            // Calcula stats usando exatamente as mesmas fórmulas do player
+            var attrs = new BaseAttributes
+            {
+                STR = baseSTR, AGI = baseAGI, VIT = baseVIT,
+                DEX = baseDEX, INT = baseINT, LUK = baseLUK
+            };
+            _stats = StatsCalculator.Calculate(attrs, level);
         }
+
+        public override void OnStartServer()
+        {
+            _maxHP     = _stats.MaxHP;
+            _currentHP = _maxHP;
+            _isDead    = false;
+
+            Debug.Log($"[NetworkMonster] {monsterDisplayName} iniciado no servidor | " +
+                      $"HP:{_maxHP:0} ATK:{_stats.ATK:0} DEF:{_stats.DEF:0}");
+        }
+
+        public override void OnStartClient()
+        {
+            // Atualiza visual assim que dados chegam do servidor
+            if (selectionIndicator) selectionIndicator.SetActive(false);
+            healthBarUI?.UpdateBar(_currentHP, _maxHP);
+
+            Debug.Log($"[NetworkMonster] {monsterDisplayName} spawnado no cliente | " +
+                      $"HP:{_currentHP:0}/{_maxHP:0}");
+        }
+
+        // ── Update (IA — só servidor) ─────────────────────────────────────
 
         private void Update()
         {
-            // Só processa input no cliente dono deste objeto
-            if (!isLocalPlayer) return;
+            if (!isServer || _isDead) return;
 
-            HandleMouseInput();
-            HandleSkillInput();
+            switch (_state)
+            {
+                case State.Idle:   ServerIdle();   break;
+                case State.Patrol: ServerPatrol(); break;
+                case State.Chase:  ServerChase();  break;
+                case State.Combat: ServerCombat(); break;
+            }
         }
 
-        // ── Mouse ─────────────────────────────────────────────────────────
-
-        private void HandleMouseInput()
+        private void ServerIdle()
         {
-            if (!Input.GetMouseButtonDown(0)) return;
-            if (EventSystem.current != null && EventSystem.current.IsPointerOverGameObject()) return;
+            if (TryAggro()) return;
+            if (patrolPoints?.Length > 0) _state = State.Patrol;
+        }
 
-            Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition);
-
-            // 1. Verifica alvo (mob, NPC, outro player)
-            if (targetableLayer != 0 &&
-                Physics.Raycast(ray, out RaycastHit hitTarget, 300f, targetableLayer))
+        private void ServerPatrol()
+        {
+            if (TryAggro()) return;
+            if (!_agent.isOnNavMesh) return;
+            if (!_agent.pathPending && _agent.remainingDistance < 0.5f)
             {
-                var targetable = hitTarget.collider.GetComponentInParent<ITargetable>();
-                if (targetable != null && !targetable.IsDead)
-                {
-                    // Tenta selecionar NetworkPlayer de outro jogador
-                    var otherNetPlayer = hitTarget.collider.GetComponentInParent<NetworkPlayer>();
-                    if (otherNetPlayer != null && !otherNetPlayer.isLocalPlayer)
-                    {
-                        UIManager.Instance?.ShowMessage($"Selecionado: {otherNetPlayer.CharacterName} Lv{otherNetPlayer.Level}");
-                        return;
-                    }
+                _patrolIndex = (_patrolIndex + 1) % patrolPoints.Length;
+                _agent.SetDestination(patrolPoints[_patrolIndex].position);
+            }
+        }
 
-                    var localPlayer = GetComponent<RPG.Character.PlayerEntity>();
-                    localPlayer?.SetTarget(targetable);
-                    UIManager.Instance?.UpdateTargetPanel(targetable);
-                    return;
+        private void ServerChase()
+        {
+            if (_aggroTarget == null || _aggroTarget.Dead)
+            { ResetAggro(); return; }
+
+            float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
+
+            if (dist > aggroRange * 2f) { ResetAggro(); return; }
+
+            if (dist <= attackRange)
+            {
+                _state = State.Combat;
+                _agent.ResetPath();
+                return;
+            }
+
+            if (_agent.isOnNavMesh)
+            {
+                _agent.stoppingDistance = attackRange * 0.85f;
+                _agent.SetDestination(_aggroTarget.transform.position);
+            }
+        }
+
+        private void ServerCombat()
+        {
+            if (_aggroTarget == null || _aggroTarget.Dead)
+            { ResetAggro(); return; }
+
+            float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
+
+            if (dist > attackRange * 1.4f) { _state = State.Chase; return; }
+
+            if (_agent.isOnNavMesh)
+            {
+                if (dist < kiteDistance)
+                {
+                    Vector3 away = (transform.position - _aggroTarget.transform.position).normalized;
+                    _agent.SetDestination(transform.position + away * (kiteDistance + 0.5f));
+                }
+                else
+                {
+                    _agent.ResetPath();
                 }
             }
 
-            // 2. Move no terreno
-            if (Physics.Raycast(ray, out RaycastHit hitTerrain, 300f, terrainLayer))
+            // Olha para o alvo
+            Vector3 dir = (_aggroTarget.transform.position - transform.position);
+            dir.y = 0f;
+            if (dir.sqrMagnitude > 0.01f)
+                transform.rotation = Quaternion.Slerp(transform.rotation,
+                    Quaternion.LookRotation(dir), 10f * Time.deltaTime);
+
+            _attackTimer += Time.deltaTime;
+            if (_attackTimer >= attackCooldown)
             {
-                Vector3 dest = hitTerrain.point;
-
-                // Valida no NavMesh local antes de enviar
-                if (NavMesh.SamplePosition(dest, out NavMeshHit navHit, 2f, NavMesh.AllAreas))
-                    dest = navHit.position;
-
-                // Movimento local imediato (responsivo)
-                _agent.SetDestination(dest);
-
-                // Sincroniza com o servidor
-                _netPlayer.CmdMoveTo(dest);
-
-                UIManager.Instance?.ClearTargetPanel();
-                _skills?.CancelPendingAction();
-                SpawnMoveIndicator(hitTerrain.point);
+                _attackTimer = 0f;
+                ServerAttack();
             }
         }
 
-        private void HandleSkillInput()
+        // ── Aggro ─────────────────────────────────────────────────────────
+
+        private bool TryAggro()
         {
-            if (Input.GetKeyDown(skill1Key)) UseSkill(0);
-            if (Input.GetKeyDown(skill2Key)) UseSkill(1);
-            if (Input.GetKeyDown(skill3Key)) UseSkill(2);
-            if (Input.GetKeyDown(skill4Key)) UseSkill(3);
+            float closest = aggroRange;
+            NetworkPlayer found = null;
+
+            foreach (var np in FindObjectsOfType<NetworkPlayer>())
+            {
+                if (np.Dead) continue;
+                float dist = Vector3.Distance(transform.position, np.transform.position);
+                if (dist < closest) { closest = dist; found = np; }
+            }
+
+            if (found != null)
+            {
+                _aggroTarget = found;
+                _state       = State.Chase;
+                Debug.Log($"[NetworkMonster] {monsterDisplayName} agrou {found.CharacterName}");
+                return true;
+            }
+            return false;
         }
 
-        private void UseSkill(int index)
+        private void ResetAggro()
         {
-            _skills?.TryUseSkill(index);
+            _aggroTarget = null;
+            if (_agent.isOnNavMesh) _agent.ResetPath();
+            _agent.stoppingDistance = 0.3f;
+            _state       = patrolPoints?.Length > 0 ? State.Patrol : State.Idle;
+            _attackTimer = 0f;
         }
 
-        private void SpawnMoveIndicator(Vector3 pos)
+        // ── Ataque (servidor) ─────────────────────────────────────────────
+
+        [Server]
+        private void ServerAttack()
         {
-            if (moveIndicatorPrefab == null) return;
-            var go = Instantiate(moveIndicatorPrefab, pos + Vector3.up * 0.02f, Quaternion.Euler(90, 0, 0));
-            Destroy(go, 1f);
+            if (_aggroTarget == null) return;
+
+            bool hit = StatsCalculator.RollHit(_stats.HIT, 20f);
+            if (!hit)
+            {
+                RpcShowMiss(_aggroTarget.transform.position);
+                return;
+            }
+
+            bool  crit = StatsCalculator.RollCrit(_stats.CRIT);
+            float dmg  = StatsCalculator.CalculatePhysicalDamage(_stats.ATK, 10f, crit, _stats.CritDMG);
+
+            Debug.Log($"[NetworkMonster] {monsterDisplayName} ataca {_aggroTarget.CharacterName} | " +
+                      $"ATK:{_stats.ATK:0} Dmg:{dmg:0} Crit:{crit}");
+
+            // Aplica dano via Command no servidor
+            _aggroTarget.ServerApplyDamage(dmg);
+            RpcPlayAnim("Attack");
+        }
+
+        // ── TakeDamage (ITargetable — chamado pelo SkillSystem do cliente) ─
+
+        [Server]
+        private void ServerTakeDamage(float rawAtk, float rawMatk, bool isPhysical)
+        {
+            if (_isDead) return;
+
+            bool  crit = StatsCalculator.RollCrit(5f);
+            float dmg  = isPhysical
+                ? StatsCalculator.CalculatePhysicalDamage(rawAtk, _stats.DEF, crit, _stats.CritDMG)
+                : StatsCalculator.CalculateMagicDamage(rawMatk, _stats.MDEF, crit, _stats.CritDMG);
+
+            dmg = Mathf.Max(1f, dmg);
+            _currentHP = Mathf.Max(0f, _currentHP - dmg);
+
+            Debug.Log($"[NetworkMonster] {monsterDisplayName} tomou dano | " +
+                      $"RawATK:{rawAtk:0} DEF:{_stats.DEF:0} Dmg:{dmg:0} " +
+                      $"Crit:{crit} HP:{_currentHP:0}/{_maxHP:0}");
+
+            RpcShowDamage(dmg, crit, transform.position);
+
+            if (_currentHP <= 0f) ServerDie();
+        }
+
+        // ITargetable.TakeDamage — o SkillSystem chama isso no cliente local
+        // Precisamos redirecionar para o servidor via Command
+        public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
+        {
+            // Se é servidor: processa direto
+            if (isServer)
+            {
+                ServerTakeDamage(rawAtk, rawMatk, isPhysical);
+                return;
+            }
+            // Se é cliente: envia Command para o servidor
+            CmdRequestTakeDamage(rawAtk, rawMatk, isPhysical);
+        }
+
+        [Command(requiresAuthority = false)]
+        private void CmdRequestTakeDamage(float rawAtk, float rawMatk, bool isPhysical)
+        {
+            ServerTakeDamage(rawAtk, rawMatk, isPhysical);
+        }
+
+        // ── Morte (servidor) ──────────────────────────────────────────────
+
+        [Server]
+        private void ServerDie()
+        {
+            _isDead = true;
+            _state  = State.Dead;
+            if (_agent.isOnNavMesh) { _agent.ResetPath(); _agent.enabled = false; }
+
+            Debug.Log($"[NetworkMonster] {monsterDisplayName} morreu!");
+
+            // XP para todos perto
+            foreach (var np in FindObjectsOfType<NetworkPlayer>())
+            {
+                float dist = Vector3.Distance(transform.position, np.transform.position);
+                if (dist <= aggroRange * 2f)
+                    RpcGrantExp(np.netId, expReward);
+            }
+
+            RpcOnDied(transform.position);
+            Invoke(nameof(ServerDestroy), 3f);
+        }
+
+        [Server]
+        private void ServerDestroy() => NetworkServer.Destroy(gameObject);
+
+        // ── ClientRpcs ────────────────────────────────────────────────────
+
+        [ClientRpc]
+        private void RpcShowDamage(float dmg, bool crit, Vector3 pos)
+        {
+            Color c = crit ? Color.yellow : Color.white;
+            FloatingTextManager.Instance?.Show(
+                crit ? $"CRÍTICO! {dmg:0}" : $"{dmg:0}", pos + Vector3.up, c);
+        }
+
+        [ClientRpc]
+        private void RpcShowMiss(Vector3 pos)
+            => FloatingTextManager.Instance?.Show("MISS", pos, Color.gray);
+
+        [ClientRpc]
+        private void RpcPlayAnim(string trigger)
+            => _animator?.SetTrigger(trigger);
+
+[ClientRpc]
+private void RpcGrantExp(uint targetNetId, long amount)
+{
+    if (NetworkClient.localPlayer == null) return;
+    if (NetworkClient.localPlayer.netId != targetNetId) return;
+
+    var charData = RPG.Managers.GameManager.Instance?.SelectedCharacter;
+    if (charData == null) return;
+
+    bool leveled = charData.AddExperience(amount);
+
+    FloatingTextManager.Instance?.Show(
+        $"+{amount} XP",
+        NetworkClient.localPlayer.transform.position + Vector3.up * 2f,
+        Color.cyan);
+
+    // ✅ Busca o PlayerEntity e atualiza stats — isso dispara OnStatsChanged
+    //    que chama UIManager.RefreshAll() atualizando HP, MP e Level na tela
+    var playerEntity = NetworkClient.localPlayer.GetComponent<PlayerEntity>();
+    if (playerEntity != null)
+    {
+        playerEntity.RefreshStats();
+
+        if (leveled)
+            FloatingTextManager.Instance?.Show("LEVEL UP!",
+                NetworkClient.localPlayer.transform.position + Vector3.up * 2.5f,
+                Color.yellow);
+    }
+}
+
+        [ClientRpc]
+        private void RpcOnDied(Vector3 pos)
+        {
+            OnDeselected();
+            // Se este mob estava selecionado, limpa o target panel
+            UIManager.Instance?.ClearTargetPanel();
+            FloatingTextManager.Instance?.Show("Morto!", pos + Vector3.up, Color.red);
+        }
+
+        // ── SyncVar Hooks ─────────────────────────────────────────────────
+
+        private void OnCurrentHPChanged(float oldVal, float newVal)
+        {
+            Debug.Log($"[NetworkMonster] {monsterDisplayName} HP sync: {oldVal:0} → {newVal:0} (max:{_maxHP:0})");
+            healthBarUI?.UpdateBar(newVal, _maxHP);
+        }
+
+        private void OnDeadChanged(bool wasAlive, bool nowDead)
+        {
+            if (nowDead && _agent != null) _agent.enabled = false;
+        }
+
+        private void OnDrawGizmosSelected()
+        {
+            Gizmos.color = Color.yellow;
+            Gizmos.DrawWireSphere(transform.position, aggroRange);
+            Gizmos.color = Color.red;
+            Gizmos.DrawWireSphere(transform.position, attackRange);
+            Gizmos.color = Color.blue;
+            Gizmos.DrawWireSphere(transform.position, kiteDistance);
         }
     }
 }
